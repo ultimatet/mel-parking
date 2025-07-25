@@ -85,111 +85,110 @@ class ParkingScraperService {
 
             // Wait for the table to load
             console.log("Waiting for data table to load...");
+            await page.waitForSelector(".odswidget-table__internal-table", {
+                timeout: 15000,
+                visible: true,
+            });
 
-            // Try different possible selectors
-            const selectors = [
-                ".odsembed-tableau",
-                ".ods-table",
-                "table.table",
-                '[role="grid"]',
-                ".dataset-table",
-            ];
+            // Wait for data rows to appear
+            await page.waitForSelector(".odswidget-table__internal-table-row", {
+                timeout: 10000,
+            });
 
-            let tableFound = false;
-            for (const selector of selectors) {
-                try {
-                    await page.waitForSelector(selector, { timeout: 5000 });
-                    tableFound = true;
-                    console.log(`Found table with selector: ${selector}`);
-                    break;
-                } catch (e) {
-                    continue;
-                }
-            }
+            // Wait a bit more for data to populate
+            await new Promise((resolve) => setTimeout(resolve, 3000));
 
-            if (!tableFound) {
-                console.log("Table not found, trying API interception...");
-                const apiData = await this.interceptAPICall(page);
-                if (apiData && apiData.length > 0) {
-                    console.log(`Successfully intercepted API data: ${apiData.length} records`);
-                    cacheService.set(cacheKey, apiData, this.scrapeInterval);
-                    this.lastScrapeTime = Date.now();
-                    return apiData;
-                }
-            }
+            console.log("Table loaded successfully");
 
             // Try to load all data
             await this.loadAllData(page);
 
-            // Extract data from the table
+            // Extract data from the table with correct parsing
             console.log("Extracting parking data...");
             const parkingData = await page.evaluate(() => {
-                const data = [];
+                const rows = document.querySelectorAll(
+                    ".odswidget-table__internal-table tbody tr.odswidget-table__internal-table-row"
+                );
+                const extractedData = [];
 
-                // Try multiple possible selectors for the data table
-                const tableSelectors = [
-                    ".odsembed-tableau table tbody tr",
-                    ".ods-table tbody tr",
-                    "table.table tbody tr",
-                    '[role="grid"] [role="row"]',
-                    ".dataset-table tbody tr",
-                    "table tbody tr",
-                ];
+                console.log(`Found ${rows.length} data rows`);
 
-                let rows = [];
-                for (const selector of tableSelectors) {
-                    rows = document.querySelectorAll(selector);
-                    if (rows.length > 0) {
-                        console.log(`Found ${rows.length} rows with selector: ${selector}`);
-                        break;
-                    }
-                }
-
-                // If no rows found in table, try to find data in page
-                if (rows.length === 0) {
-                    // Check if data is in JSON script tag
-                    const scripts = document.querySelectorAll("script");
-                    for (const script of scripts) {
-                        if (
-                            script.textContent.includes("bay_id") ||
-                            script.textContent.includes("parking")
-                        ) {
-                            try {
-                                // Try to extract JSON data from script
-                                const match = script.textContent.match(/\{.*bay_id.*\}/);
-                                if (match) {
-                                    return JSON.parse(match[0]);
-                                }
-                            } catch (e) {
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // Parse each row
                 rows.forEach((row, index) => {
-                    const cells = row.querySelectorAll("td");
-                    if (cells.length >= 5) {
-                        // Map cells to expected data structure
-                        // Adjust indices based on actual table structure
-                        const spotData = {
-                            bay_id: cells[0]?.textContent?.trim() || `BAY-${index}`,
-                            st_marker_id: cells[1]?.textContent?.trim() || "",
-                            status: cells[2]?.textContent?.trim() || "Unknown",
-                            lat: cells[3]?.textContent?.trim() || "",
-                            lon: cells[4]?.textContent?.trim() || "",
-                            lastupdated: cells[5]?.textContent?.trim() || new Date().toISOString(),
+                    const cells = row.querySelectorAll("td.odswidget-table__cell");
+
+                    if (cells.length >= 7) {
+                        // Helper function to get cell text content
+                        const getCellText = (cell) => {
+                            // Try to get text from span with title attribute first
+                            const span = cell.querySelector("span[title]");
+                            if (span) {
+                                return span.getAttribute("title") || span.textContent.trim();
+                            }
+                            // Fallback to cell text content
+                            return cell.textContent.trim();
                         };
 
-                        // Only add if we have valid coordinates
-                        if (spotData.lat && spotData.lon) {
-                            data.push(spotData);
+                        // Based on the actual HTML structure:
+                        // Column 0: Row number (skip this)
+                        // Column 1: Lastupdated
+                        // Column 2: Status_Timestamp
+                        // Column 3: Zone_Number
+                        // Column 4: Status_Description (Present/Unoccupied)
+                        // Column 5: KerbsideID
+                        // Column 6: Location (lat, lon coordinates)
+
+                        const rowNumber = getCellText(cells[0]);
+                        const lastupdated = getCellText(cells[1]);
+                        const statusTimestamp = getCellText(cells[2]);
+                        const zoneNumber = getCellText(cells[3]);
+                        const statusDescription = getCellText(cells[4]);
+                        const kerbsideID = getCellText(cells[5]);
+                        const locationText = getCellText(cells[6]);
+
+                        // Parse coordinates from location string
+                        let lat = "",
+                            lon = "";
+                        if (locationText) {
+                            const coords = locationText.split(",").map((coord) => coord.trim());
+                            if (coords.length >= 2) {
+                                lat = coords[0];
+                                lon = coords[1];
+                            }
                         }
+
+                        // Only add records with valid data
+                        if (kerbsideID && statusDescription && lat && lon) {
+                            extractedData.push({
+                                bay_id: kerbsideID,
+                                st_marker_id: kerbsideID, // Using KerbsideID as marker ID
+                                status: statusDescription, // "Present" or "Unoccupied"
+                                lat: lat,
+                                lon: lon,
+                                lastupdated: lastupdated,
+                                status_timestamp: statusTimestamp,
+                                zone_number: zoneNumber,
+                                row_number: rowNumber,
+                            });
+                        } else {
+                            console.log(`Skipping row ${index + 1}: missing required data`, {
+                                rowNumber,
+                                kerbsideID,
+                                statusDescription,
+                                lat,
+                                lon,
+                                lastupdated,
+                                statusTimestamp,
+                            });
+                        }
+                    } else {
+                        console.log(
+                            `Row ${index + 1} has only ${cells.length} cells, expected at least 7`
+                        );
                     }
                 });
 
-                return data;
+                console.log(`Successfully extracted ${extractedData.length} parking records`);
+                return extractedData;
             });
 
             console.log(`Scraped ${parkingData.length} parking records`);
@@ -239,6 +238,8 @@ class ParkingScraperService {
                 lat: String(-37.8136 + (Math.random() - 0.5) * 0.02),
                 lon: String(144.9631 + (Math.random() - 0.5) * 0.02),
                 lastupdated: new Date(Date.now() - Math.random() * 3600000).toISOString(),
+                zone_number: `708${Math.floor(Math.random() * 10)}`,
+                status_timestamp: new Date(Date.now() - Math.random() * 3600000).toISOString(),
             });
         }
 
@@ -246,93 +247,80 @@ class ParkingScraperService {
     }
 
     /**
-     * Intercept API calls made by the page
-     */
-    async interceptAPICall(page) {
-        return new Promise((resolve) => {
-            const apiData = [];
-            let timeout;
-
-            // Set up request interception
-            page.on("response", async (response) => {
-                const url = response.url();
-
-                // Check if this is an API call for parking data
-                if (
-                    (url.includes("vh2v-4nfs") || url.includes("parking")) &&
-                    (url.includes(".json") || response.headers()["content-type"]?.includes("json"))
-                ) {
-                    try {
-                        const data = await response.json();
-                        if (Array.isArray(data) && data.length > 0) {
-                            console.log(`Intercepted API data from: ${url}`);
-                            apiData.push(...data);
-
-                            // Clear existing timeout
-                            if (timeout) clearTimeout(timeout);
-
-                            // Wait a bit more for additional data
-                            timeout = setTimeout(() => resolve(apiData), 2000);
-                        }
-                    } catch (e) {
-                        // Not JSON or failed to parse
-                    }
-                }
-            });
-
-            // Reload the page to capture API calls
-            page.reload({ waitUntil: "networkidle2" })
-                .then(() => {
-                    // Fallback timeout
-                    setTimeout(() => resolve(apiData), 10000);
-                })
-                .catch(() => resolve(apiData));
-        });
-    }
-
-    /**
-     * Try to load all data by handling pagination
+     * Try to load all data by handling pagination or infinite scroll
      */
     async loadAllData(page) {
         try {
-            // Check for "Load more" button
-            const loadMoreSelectors = [
-                'button:contains("Load more")',
-                ".load-more",
-                '[aria-label*="more"]',
-                "button.ods-button-more",
-                ".show-more-button",
-            ];
+            console.log("Checking for pagination/infinite scroll...");
 
-            for (const selector of loadMoreSelectors) {
-                try {
-                    const button = await page.$(selector);
-                    if (button) {
-                        console.log('Found "Load more" button, clicking...');
-                        await button.click();
-                        await page.waitForTimeout(2000);
-                        break;
+            // Check initial row count
+            let previousCount = await page.evaluate(() => {
+                return document.querySelectorAll(".odswidget-table__internal-table-row").length;
+            });
+
+            console.log(`Initial row count: ${previousCount}`);
+
+            // Try scrolling to load more data
+            let attempts = 0;
+            const maxAttempts = 15; // Increased attempts to get more data
+
+            while (attempts < maxAttempts) {
+                // Scroll to bottom of the table container
+                await page.evaluate(() => {
+                    const tableContainer = document.querySelector(".odswidget-table__records");
+                    if (tableContainer) {
+                        tableContainer.scrollTop = tableContainer.scrollHeight;
                     }
-                } catch (e) {
-                    continue;
+                    // Also scroll the page
+                    window.scrollTo(0, document.body.scrollHeight);
+                });
+
+                // Wait for potential new data to load
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+
+                // Check if new rows were loaded
+                const currentCount = await page.evaluate(() => {
+                    return document.querySelectorAll(".odswidget-table__internal-table-row").length;
+                });
+
+                console.log(`Scroll attempt ${attempts + 1}: ${currentCount} rows loaded`);
+
+                // If no new rows were loaded, we've reached the end
+                if (currentCount === previousCount) {
+                    // Try one more aggressive scroll
+                    await page.evaluate(() => {
+                        // Trigger scroll events
+                        const tableContainer = document.querySelector(".odswidget-table__records");
+                        if (tableContainer) {
+                            const event = new Event("scroll", { bubbles: true });
+                            tableContainer.dispatchEvent(event);
+                        }
+                    });
+
+                    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+                    const finalCount = await page.evaluate(() => {
+                        return document.querySelectorAll(".odswidget-table__internal-table-row")
+                            .length;
+                    });
+
+                    if (finalCount === currentCount) {
+                        console.log(
+                            "No new rows loaded after aggressive scroll, stopping attempts"
+                        );
+                        break;
+                    } else {
+                        currentCount = finalCount;
+                    }
                 }
+
+                previousCount = currentCount;
+                attempts++;
             }
 
-            // Or try to change page size
-            const pageSizeSelector = await page.$('select[name="pagesize"], .page-size-selector');
-            if (pageSizeSelector) {
-                console.log("Found page size selector, setting to maximum...");
-                const options = await page.$$eval('select[name="pagesize"] option', (options) =>
-                    options.map((option) => option.value)
-                );
-                if (options.length > 0) {
-                    const maxValue = Math.max(...options.map(Number).filter((n) => !isNaN(n)));
-                    await page.select('select[name="pagesize"]', String(maxValue));
-                    await page.waitForTimeout(2000);
-                }
-            }
+            console.log(`Final row count after scrolling: ${previousCount}`);
         } catch (e) {
-            console.log("No pagination controls found, continuing with default data");
+            console.log("Error during pagination:", e.message);
         }
     }
 
@@ -355,9 +343,7 @@ class ParkingScraperService {
     async getAvailableSpots() {
         try {
             const data = await this.scrapeParkingData();
-            const availableSpots = data.filter(
-                (spot) => spot.status !== PARKING_STATUS.PRESENT && spot.status !== "Present"
-            );
+            const availableSpots = data.filter((spot) => spot.status === "Unoccupied");
 
             return {
                 total: availableSpots.length,
@@ -383,9 +369,7 @@ class ParkingScraperService {
                 return distance <= radius;
             });
 
-            const availableNearby = nearbySpots.filter(
-                (spot) => spot.status !== PARKING_STATUS.PRESENT && spot.status !== "Present"
-            );
+            const availableNearby = nearbySpots.filter((spot) => spot.status === "Unoccupied");
 
             return {
                 total: nearbySpots.length,
@@ -414,9 +398,7 @@ class ParkingScraperService {
                 return lat > minLat && lat < maxLat && lon > minLon && lon < maxLon;
             });
 
-            const availableInArea = areaSpots.filter(
-                (spot) => spot.status !== PARKING_STATUS.PRESENT && spot.status !== "Present"
-            );
+            const availableInArea = areaSpots.filter((spot) => spot.status === "Unoccupied");
 
             return {
                 bounds: areaBounds,
@@ -457,10 +439,8 @@ class ParkingScraperService {
             const data = await this.scrapeParkingData();
 
             const totalSpots = data.length;
-            const availableSpots = data.filter(
-                (spot) => spot.status !== PARKING_STATUS.PRESENT && spot.status !== "Present"
-            ).length;
-            const occupiedSpots = totalSpots - availableSpots;
+            const availableSpots = data.filter((spot) => spot.status === "Unoccupied").length;
+            const occupiedSpots = data.filter((spot) => spot.status === "Present").length;
 
             return {
                 total: totalSpots,
@@ -509,13 +489,15 @@ class ParkingScraperService {
         return {
             bayId: spot.bay_id,
             status: spot.status,
-            isAvailable: spot.status !== PARKING_STATUS.PRESENT && spot.status !== "Present",
+            isAvailable: spot.status === "Unoccupied",
             location: {
                 lat: parseFloat(spot.lat),
                 lon: parseFloat(spot.lon),
             },
             lastUpdated: spot.lastupdated,
-            streetMarker: spot.st_marker_id || spot.marker_id,
+            streetMarker: spot.st_marker_id,
+            zoneNumber: spot.zone_number,
+            statusTimestamp: spot.status_timestamp,
         };
     }
 
@@ -528,4 +510,5 @@ class ParkingScraperService {
     }
 }
 
+// IMPORTANT: Export a new instance of the class
 module.exports = new ParkingScraperService();
